@@ -1,0 +1,250 @@
+import os
+import time
+import random
+
+import numpy as np
+from playwright.sync_api import sync_playwright
+
+GAME_URL = "https://wayou.github.io/t-rex-runner/"
+
+EPISODES = 1000  
+ALPHA = 0.05
+GAMMA = 0.9
+EPSILON = 0.1
+STEP_DELAY = 0.0
+MAX_STEPS = 150000
+MODEL_FILE = "q_table.npy"
+
+TRAIN_MODE = True
+LOAD_MODEL = True
+SAVE_MODEL = True
+
+q_table = {}
+
+def get_q(state):
+    if state not in q_table:
+        q_table[state] = [0.0, 0.0, 0.0]
+    return q_table[state]
+
+def load_q_table():
+    global q_table
+    if LOAD_MODEL and os.path.exists(MODEL_FILE):
+        try:
+            loaded = np.load(MODEL_FILE, allow_pickle=True).item()
+            if isinstance(loaded, dict) and len(list(loaded.values())[0]) == 3:
+                temp_table = {}
+                for state, values in loaded.items():
+                    if isinstance(state, int):
+                        is_bird = 1 if state >= 10 else 0
+                        dist_bucket = state % 10
+                        temp_table[(dist_bucket, is_bird)] = values
+                    else:
+                        temp_table[state] = values
+                q_table = temp_table
+                print("Загружена и нормализована Q-таблица.")
+            else:
+                print("Старая таблица несовместима. Создаём новую.")
+                q_table = {}
+        except Exception as e:
+            print(f"Ошибка загрузки ({e}). Создаём новую таблицу.")
+            q_table = {}
+    else:
+        print("Q-таблица создана с нуля.")
+
+def save_q_table():
+    if SAVE_MODEL:
+        valid_q_table = {
+            k: v for k, v in q_table.items() 
+            if isinstance(k, tuple) and len(k) == 2 and isinstance(v, list) and len(v) == 3
+        }
+        np.save(MODEL_FILE, valid_q_table, allow_pickle=True)
+        print(f"Q-таблица сохранена в файл {MODEL_FILE} (записано {len(valid_q_table)} валидных состояний)")
+
+def get_state(page):
+    try:
+        result = page.evaluate(
+            """
+            () => {
+                const runner = window.Runner?.instance_;
+                if (!runner) return { status: "NO_RUNNER" };
+                if (runner.crashed) return { status: "DEAD" };
+                if (!runner.playing) return { status: "NOT_PLAYING" };
+
+                const dino = runner.tRex;
+                const obstacles = runner.horizon?.obstacles || [];
+
+                if (obstacles.length === 0) {
+                    return { status: "OK", distance: 1000, is_bird: 0 };
+                }
+
+                const obstacle = obstacles[0];
+                const distance = obstacle.xPos - dino.xPos;
+                const typeStr = String(obstacle.type || "");
+                const is_bird = typeStr.includes("PTERODACTYL") ? 1 : 0;
+
+                return {
+                    status: "OK",
+                    distance: distance,
+                    is_bird: is_bird
+                };
+            }
+            """
+        )
+
+        status = result["status"]
+        if status != "OK":
+            return -1, status
+
+        distance = result["distance"]
+        is_bird = result["is_bird"]
+
+        if distance > 150:
+            dist_bucket = 0
+        elif distance > 70:
+            dist_bucket = 1
+        else:
+            dist_bucket = 2
+
+        state = (dist_bucket, is_bird)
+        return state, f"dist={distance:.0f}, bird={is_bird}"
+
+    except Exception as error:
+        return -1, f"ERROR: {error}"
+
+def choose_action(state):
+    if TRAIN_MODE and random.random() < EPSILON:
+        return random.choice([0, 1, 2])
+    return int(np.argmax(get_q(state)))
+
+def update_q_table(state, action, reward, next_state):
+    current_q = get_q(state)[action]
+    max_next_q = 0 if next_state == -1 else max(get_q(next_state))
+    get_q(state)[action] = current_q + ALPHA * (reward + GAMMA * max_next_q - current_q)
+
+def start_game(page):
+    # 1. Перезапускаем игру через API
+    page.evaluate("() => { if (window.Runner?.instance_) window.Runner.instance_.play(); }")
+    
+    # 2. Даем игре долю секунды на сброс состояния "Game Over"
+    time.sleep(0.1)
+    
+    # 3. Нажимаем Пробел, чтобы динозавр побежал
+    page.keyboard.press("Space")
+    
+    # 4. Небольшая пауза, чтобы динозавр успел встать на ноги и игра началась
+    time.sleep(0.5)
+    
+    state, info = get_state(page)
+    return state, info
+
+def print_q_table():
+    print("\nИтоговая Q-таблица:")
+    print("Действия: [0=Ничего, 1=Прыжок, 2=Присесть]")
+    
+    def sort_key(item):
+        state = item[0]
+        if isinstance(state, tuple) and len(state) == 2 and all(isinstance(x, int) for x in state):
+            return state
+        if isinstance(state, int):
+            is_bird = 1 if state >= 10 else 0
+            dist_bucket = state % 10
+            return (dist_bucket, is_bird)
+        return (999, 999)
+
+    valid_items = [
+        (state, values) for state, values in q_table.items() 
+        if isinstance(state, tuple) and len(state) == 2
+    ]
+
+    if not valid_items:
+        print("В Q-таблице нет валидных данных для отображения.")
+        return
+
+    for state, values in sorted(valid_items, key=sort_key):
+        try:
+            best_action = int(np.argmax(values))
+            action_name = ["НИЧЕГО", "ПРЫЖОК", "ПРИСЕСТЬ"][best_action]
+            dist_bucket, is_bird = state
+            dist_str = {0: ">150", 1: "70-150", 2: "<70"}.get(dist_bucket, str(dist_bucket))
+            print(f"Состояние (dist={dist_str}, bird={is_bird}): [{values[0]:.2f}, {values[1]:.2f}, {values[2]:.2f}] -> {action_name}")
+        except Exception:
+            print(f"Состояние {state}: {values} -> ОШИБКА ОТОБРАЖЕНИЯ")
+
+def main():
+    print("Запускаем режим с видимым окном и автозапуском...")
+    load_q_table()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            channel="chrome",
+            headless=False, 
+            args=[
+                "--disable-gpu", 
+                "--disable-extensions",
+                "--no-sandbox", 
+                "--disable-dev-shm-usage"
+            ]
+        )
+
+        page = browser.new_page(viewport={"width": 800, "height": 600})
+        page.goto(GAME_URL, wait_until="networkidle")
+        
+        time.sleep(3.0) 
+
+        for episode in range(1, EPISODES + 1):
+            if episode % 50 == 0:
+                print(f"\n--- Эпизод {episode}/{EPISODES} ---")
+
+            state, _ = start_game(page)
+            
+            if state == -1:
+                continue
+            
+            total_reward = 0
+
+            for step in range(1, MAX_STEPS + 1):
+                action = choose_action(state)
+                
+                if action == 1:
+                    page.keyboard.press("Space")
+                elif action == 2:
+                    page.keyboard.down("ArrowDown")
+                else:
+                    page.keyboard.up("ArrowDown")
+
+                next_state, _ = get_state(page)
+
+                if next_state == -1:
+                    reward = -100
+                else:
+                    reward = 1
+
+                if TRAIN_MODE:
+                    try:
+                        if (isinstance(state, tuple) and len(state) == 2 and 
+                            (next_state == -1 or (isinstance(next_state, tuple) and len(next_state) == 2))):
+                            update_q_table(state, action, reward, next_state)
+                    except Exception:
+                        pass
+
+                total_reward += reward
+                state = next_state
+
+                if next_state == -1:
+                    page.keyboard.up("ArrowDown") 
+                    break
+
+            if TRAIN_MODE and episode % 100 == 0:
+                save_q_table()
+
+        print("\nОБУЧЕНИЕ ЗАВЕРШЕНО!")
+        print_q_table()
+        
+        if TRAIN_MODE:
+            save_q_table()
+        
+        # Убрано ожидание нажатия Enter. Браузер закроется сам.
+        browser.close()
+
+if __name__ == "__main__":
+    main()
